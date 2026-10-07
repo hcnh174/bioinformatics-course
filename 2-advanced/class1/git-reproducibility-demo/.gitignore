@@ -1,0 +1,11 @@
+# Generated analysis results
+out/
+
+# R temporary files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Operating system files
+.DS_Store
+Thumbs.db
