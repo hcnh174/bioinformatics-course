@@ -1,0 +1,86 @@
+# ============================================================
+# Snakefile — Genome Analysis パイプライン (Snakemake, conda + modular)
+#   - ルールは rules/*.smk に分離 / rules live in rules/*.smk
+#   - 各ルールに conda: ディレクティブ / per-rule conda envs (envs/*.yaml)
+#   - 入力 FASTQ は samples.tsv から取得 / inputs come from a TSV sample sheet
+#
+#   使い方 / Usage:
+#     snakemake -n                       # ドライラン / dry-run
+#     snakemake -c4 --use-conda -p       # conda 環境を自動構築して実行 / run with conda
+# ============================================================
+import os
+import csv
+
+configfile: "config.yaml"
+
+exp = os.path.expanduser
+
+# ---- パス・パラメータの展開 / expand paths & parameters ----
+COURSE            = exp(config["course_dir"])
+WORK              = exp(config["work_dir"])
+REF               = exp(config["ref"])
+BWA_INDEX         = exp(config["bwa_index"])
+KNOWN             = [exp(k) for k in config["known_sites"]]
+GERMLINE_RESOURCE = exp(config["germline_resource"])
+INTERVALS         = exp(config["intervals"])
+THREADS           = config["threads"]
+JAVA_MEM          = config["java_mem"]
+FP                = config["fastp"]
+KNOWN_ARG         = " ".join(f"--known-sites {k}" for k in KNOWN)
+
+# ---- サンプルシート (TSV) の読み込み / read the sample sheet ----
+#   列 / columns: sample  type(tumor|normal)  fq1  fq2
+SAMPLES_TSV = exp(config["samples"])
+SAMPLES_TBL = {}
+TUMOR = None
+NORMAL = None
+with open(SAMPLES_TSV, newline="") as fh:
+    for row in csv.DictReader(fh, delimiter="\t"):
+        s = row["sample"].strip()
+        SAMPLES_TBL[s] = {
+            "fq1":  exp(row["fq1"].strip()),
+            "fq2":  exp(row["fq2"].strip()),
+            "type": (row.get("type") or "").strip().lower(),
+        }
+        if   SAMPLES_TBL[s]["type"] == "tumor":  TUMOR  = s
+        elif SAMPLES_TBL[s]["type"] == "normal": NORMAL = s
+
+SAMPLES = list(SAMPLES_TBL.keys())
+# type 列が無ければ config の値をフォールバック / fall back to config if no 'type' column
+TUMOR  = TUMOR  or config.get("tumor")
+NORMAL = NORMAL or config.get("normal")
+
+if TUMOR is None or NORMAL is None:
+    raise WorkflowError("samples.tsv か config で tumor / normal を特定できません "
+                        "/ could not determine tumor & normal from samples.tsv or config")
+
+# ---- 出力ディレクトリ / output directories ----
+D_FASTP   = f"{WORK}/01fastp"
+D_BWA     = f"{WORK}/02bwa"
+D_MARKDUP = f"{WORK}/03markduplicate"
+D_BQSR    = f"{WORK}/04baserecalibrator"
+D_MUTECT2 = f"{WORK}/05variantcall"
+D_HC      = f"{WORK}/06haplotypecaller"
+
+# サンプル名の制約 / restrict the {sample} wildcard
+wildcard_constraints:
+    sample = "|".join(SAMPLES)
+
+# fastp の入力を TSV から引く関数 / look up FASTQ inputs from the sample sheet
+def fastq_input(wildcards):
+    row = SAMPLES_TBL[wildcards.sample]
+    return {"r1": row["fq1"], "r2": row["fq2"]}
+
+# ---- 最終成果物（デフォルトターゲット）/ final targets (default rule) ----
+rule all:
+    input:
+        f"{D_MUTECT2}/{TUMOR}_somatic_filtered.vcf.gz",
+        f"{D_HC}/{NORMAL}_germline_merged_filtered.vcf.gz",
+
+# ---- ルール定義を読み込み / include rule definitions ----
+include: "rules/fastp.smk"
+include: "rules/bwa.smk"
+include: "rules/markduplicates.smk"
+include: "rules/bqsr.smk"
+include: "rules/mutect2.smk"
+include: "rules/haplotypecaller.smk"

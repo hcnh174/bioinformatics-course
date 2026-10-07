@@ -1,0 +1,43 @@
+# ============================================================
+# config.yaml — Snakemake パイプライン設定 / pipeline configuration
+# ============================================================
+
+# --- サンプルシート（入力 FASTQ のパスを記載）/ sample sheet (TSV) ---
+#   列 / columns: sample  type(tumor|normal)  fq1  fq2
+samples: "samples.tsv"
+
+# --- ベースディレクトリ / Base directories ---
+course_dir: "~/data"     # 講義データ（参照等）/ course data
+work_dir:   "~/pipeline_res/snakemake"     # 解析結果の出力先 / analysis output root
+
+# --- 参照ゲノムとインデックス / Reference & index ---
+ref:       "~/data/ref/hg19/hg19.fa"
+bwa_index: "~/data/ref/hg19/bwa_index/hg19_bwa"
+
+# --- BQSR 用の既知サイト / Known sites for BaseRecalibrator ---
+known_sites:
+  - "~/data/vcf/1000G_omni2.5.hg19.sites.vcf"
+  - "~/data/vcf/1000G_phase1.indels.hg19.sites.vcf"
+  - "~/data/vcf/Mills_and_1000G_gold_standard.indels.hg19.sites.vcf"
+  - "~/data/vcf/dbsnp_138.hg19.vcf"
+
+# --- Mutect2 用リソース / Mutect2 resources ---
+germline_resource: "~/data/vcf/af-only-gnomad.raw.sites.chr.vcf"
+intervals:         "~/data/dna/braf_hg19_exon15.bed"
+
+# --- 腫瘍・正常の指定（TSV の type 列が優先）/ tumor & normal (TSV 'type' column wins) ---
+tumor:  "tumor"
+normal: "normal"
+
+# --- 実行パラメータ / Runtime parameters ---
+threads:  4
+java_mem: "-Xmx10g"
+
+# --- fastp パラメータ / fastp parameters ---
+fastp:
+  n: 10
+  l: 15
+  q: 20
+  t: 1
+  T: 1
+  w: 4
