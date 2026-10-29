@@ -1,0 +1,190 @@
+#if (!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+#BiocManager::install(c("DEP", "clusterProfiler", "org.Hs.eg.db"))
+
+library(DEP)
+library(dplyr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Load MaxQuant proteinGroups.txt data directly from the URL
+# URLからMaxQuantのproteinGroups.txtデータを直接読み込みます
+url_pg <- "https://raw.githubusercontent.com/statOmics/pda/data/quantification/cancer/proteinGroups.txt"
+data <- read.delim(url_pg, stringsAsFactors = FALSE, check.names = TRUE)
+
+# check the number of rows and columns, respectively
+# 行数と列数をそれぞれ確認します
+dim(data)
+
+# List the column names. We will focus on the columns starting with LFQ.intensity for the analysis
+# 列名を一覧表示します。解析ではLFQ.intensityで始まる列に注目します
+colnames(data)
+
+# Standard MaxQuant QC filtering: remove contaminants, reverse (decoy) hits, and proteins only identified by a modification site
+# MaxQuantの標準的な品質管理フィルタリング：汚染物質、reverse（デコイ）ヒット、修飾部位のみで同定されたタンパク質を除外します
+data <- data %>% filter(
+	Reverse != "+", 
+	Contaminant != "+",
+	Only.identified.by.site != "+")
+
+# check the number of rows again
+# 行数を再度確認します
+paste0("number of rows after filtering: ", dim(data)[1])
+
+# The dataset uses unique Uniprot identifiers. Gene names are more useful but are not unique per row
+# このデータセットでは一意なUniProt識別子が使われています。遺伝子名の方が便利ですが、各行で一意とは限りません
+data %>% group_by(Gene.names) %>% summarize(frequency = n()) %>% arrange(desc(frequency)) %>% filter(frequency > 1)
+
+# Create a unique name for each row. For proteins without a gene name, use the Uniprot ID
+# 各行に一意な名前を付けます。遺伝子名がないタンパク質にはUniProt IDを使用します
+data_unique <- DEP::make_unique(data, "Gene.names", "Protein.IDs", delim = ";")
+head(data_unique[,c('ID', 'name')])
+
+# Confirm that there are no duplicated names
+# 重複した名前がないことを確認します
+data_unique$name %>% duplicated() %>% any()
+data_unique %>% group_by(Gene.names) %>% summarize(frequency = n()) %>% arrange(desc(frequency)) %>% filter(frequency > 1)
+
+# Define the experimental design directly from the column names.
+# 列名から実験デザインを直接定義します。
+# The sample condition (OR/PD) is encoded in the LFQ intensity column names, so we can build the design table programmatically:
+# サンプル条件（OR/PD）はLFQ強度の列名に含まれているため、プログラムで実験デザイン表を作成できます。
+lfq_cols <- grep("^LFQ\\.intensity\\.", colnames(data_unique))
+sample_labels <- sub("^LFQ\\.intensity\\.", "", colnames(data_unique)[lfq_cols])
+
+condition <- substr(sample_labels, 1, 2)          # "OR" or "PD"
+replicate <- ave(seq_along(sample_labels), condition, FUN = seq_along)
+
+exp_design <- data.frame(label = sample_labels, condition = condition, replicate = replicate)
+exp_design
+# Convert to a SummarizedExperiment object which assembles the log2-transformed protein abundance data, annotations, and the design.
+# log2変換したタンパク質量データ、注釈、実験デザインをまとめたSummarizedExperimentオブジェクトに変換します。
+data_se <- DEP::make_se(data_unique, lfq_cols, exp_design)
+# inspect the summarized experiment object
+# SummarizedExperimentオブジェクトの内容を確認します
+data_se
+
+# Missing values in LFQ proteomics are usually not missing at random.
+# LFQプロテオミクスの欠損値は、通常、ランダムに発生するわけではありません。
+# They tend to occur for low-abundance proteins that fall below the detection limit (left-censored data).
+# 検出限界を下回る低存在量のタンパク質で発生しやすく、これは左打ち切りデータに相当します。
+# This is a major conceptual difference from RNA-seq.
+# これはRNA-seqとの重要な概念上の違いです。
+DEP::plot_frequency(data_se)      # how many proteins have how many missing values
+DEP::plot_numbers(data_se)        # proteins quantified per sample
+
+# Keep proteins with valid values in all replicates of at least one condition
+# 少なくとも一方の条件で、すべての反復サンプルに有効値があるタンパク質を残します
+data_filt <- DEP::filter_missval(data_se, thr = 0) # or less stringently: thr=1
+# check the number of rows again
+# 行数を再度確認します
+paste0("number of rows after filtering missing values: ", dim(data_filt)[1])
+DEP::plot_numbers(data_filt)        # proteins quantified per sample
+
+# Plot a barplot of the protein identification overlap between samples
+# サンプル間でタンパク質同定結果がどの程度重複するかを棒グラフで表示します
+plot_coverage(data_filt)
+
+# Normalization using variance-stabilizing transformation
+# 分散安定化変換を用いて正規化します
+data_norm <- DEP::normalize_vsn(data_filt)
+DEP::plot_normalization(data_filt, data_norm)   # before/after boxplots
+# Plot a heatmap of proteins with missing values
+# 欠損値のあるタンパク質をヒートマップで表示します
+DEP::plot_missval(data_filt)
+
+# Plot intensity distributions and cumulative fraction of proteins with and without missing values
+# 強度分布と、欠損値のある／ないタンパク質の累積割合をプロットします
+DEP::plot_detect(data_filt)                          # confirm left-censoring pattern
+
+# Because missing values are non-random, standard mean/median imputation would underestimate the low-abundance signal.
+# 欠損値はランダムに発生するわけではないため、通常の平均値・中央値による補完では低存在量シグナルを過小評価してしまいます。
+# DEP implements MinProb, which imputes missing values using random draws from a Gaussian distribution centered around a minimal value.
+# DEPではMinProbを利用できます。これは最小値付近を中心とするガウス分布から乱数を生成して欠損値を補完します。
+data_imp <- DEP::impute(data_norm, fun = "MinProb", q = 0.01)
+
+# Plot intensity distributions before and after imputation
+# 補完前後の強度分布をプロットします
+DEP::plot_imputation(data_norm, data_imp)
+
+# Differential abundance testing using moderated t-tests via limma relative: PD relative to OR
+# limmaによるモデレートt検定を用いて差次的存在量を検定します（ORに対するPDの比較）
+data_diff <- DEP::test_diff(data_imp, type = "control", control = "OR")
+
+# Apply Benjamini-Hochberg FDR correction and filter by adjusted p value and log2 fold change
+# Benjamini–Hochberg法でFDR補正し、調整済みp値とlog2 fold changeでフィルタリングします
+dep <- DEP::add_rejections(data_diff, alpha = 0.05, lfc = log2(1.5))
+
+# convert to table format
+# テーブル形式に変換します
+results <- DEP::get_results(dep)
+
+# sort by p value and display top 5 proteins
+# p値で並べ替え、上位5つのタンパク質を表示します
+head(results[order(results$PD_vs_OR_p.val), ])
+
+# Samples should cluster by condition in a PCA plot
+# PCAプロットでは、サンプルが条件ごとにクラスターを形成することが期待されます
+plot_pca(dep, x = 1, y = 2, indicate = "condition")     # sample-level QC
+
+# Plot the Pearson correlation matrix
+# Pearson相関行列をプロットします
+DEP::plot_cor(dep, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+
+# Samples should cluster by condition in a heatmap
+# ヒートマップでは、サンプルが条件ごとにクラスターを形成することが期待されます
+DEP::plot_heatmap(dep, type = "centered", kmeans = TRUE, k = 6)
+
+# A volcano plot shows the adjusted p-value in the y axis and the fold-change in the x axis.
+# ボルケーノプロットでは、y軸に調整済みp値、x軸に変化倍率（fold change）を表示します。
+# Proteins of interest should appear in the upper right or left regions
+# 注目すべきタンパク質は、プロットの右上または左上の領域に現れることが期待されます
+DEP::plot_volcano(dep, contrast = "PD_vs_OR", label_size = 3, add_names = TRUE)
+# Plot a barplot for USP15 and IKBKG
+# USP15とIKBKGの棒グラフを表示します
+DEP::plot_single(dep, proteins = c("HSPE1", "SERBP1"), type="centered")
+
+# Pathway/enrichment analysis. Note: takes several minutes to run.
+# パスウェイ／エンリッチメント解析。実行には数分かかります。
+# make a list of significant proteins
+# 有意なタンパク質のリストを作成します
+sig_genes <- results %>% filter(PD_vs_OR_p.adj < 0.05) %>% pull(name)
+print('Proteins with differential abundance betweem PD and OR:')
+print(sig_genes)
+
+# find biological process GO terms enriched in OR or PD samples
+# ORまたはPDサンプルで濃縮されている生物学的プロセス（BP）のGO用語を検索します
+# Note: set pvalueCutoff and qvalueCutoff more stringently for your final analysis!
+# 注意：最終解析では、pvalueCutoffとqvalueCutoffをより厳しい値に設定してください。
+ego <- clusterProfiler::enrichGO(gene=sig_genes, OrgDb=org.Hs.eg.db, keyType="SYMBOL", ont="BP", pAdjustMethod="BH", 
+                                 pvalueCutoff=1, qvalueCutoff=1)
+clusterProfiler::dotplot(ego)
+
+# Remove missing and duplicate gene symbols
+# 欠損している遺伝子シンボルと重複した遺伝子シンボルを除去します
+sig_genes_clean <- unique(sig_genes[!is.na(sig_genes) & sig_genes != ""])
+
+# Convert gene symbols to Entrez IDs
+# 遺伝子シンボルをEntrez IDに変換します
+gene_mapping <- clusterProfiler::bitr(sig_genes_clean, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+kegg_genes <- unique(gene_mapping$ENTREZID)
+#cat("Input symbols:", length(sig_genes_clean), "\n")
+#cat("Mapped Entrez IDs:", length(kegg_genes), "\n")
+
+# Perform KEGG pathway enrichment
+# KEGGパスウェイのエンリッチメント解析を実行します
+ekegg <- clusterProfiler::enrichKEGG(gene=kegg_genes, organism="hsa", keyType="ncbi-geneid", pAdjustMethod="BH", 
+                                     pvalueCutoff=1, qvalueCutoff=1)
+
+# Display results and plot enriched pathways
+# 結果を表示し、濃縮されたパスウェイをプロットします
+kegg_results <- as.data.frame(ekegg)
+
+cat("Enriched KEGG pathways:", nrow(kegg_results), "\n")
+clusterProfiler::dotplot(ekegg, showCategory = 15) + ggtitle("KEGG Pathway Enrichment")
+
+# Save analyzed data
+# 解析済みデータを保存します
+save(data_se, data_norm, data_imp, data_diff, dep, file = "proteomics.RData")
+# These data can be loaded in future R sessions using this command
+# 次回以降のRセッションでは、次のコマンドでこれらのデータを読み込めます
+#load("proteomics.RData")
