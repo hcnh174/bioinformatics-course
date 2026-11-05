@@ -1,0 +1,63 @@
+---
+title: "KEGG pathway"
+output: html_document
+date: "2026-11-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries}
+library(pathview)
+```
+
+```{r genes}
+gene_fc <- c(
+  "3099" =  1.5,  # HK2
+  "6513" =  1.2,  # SLC2A1
+  "5213" =  1.1,  # PFKM
+  "226"  =  0.8,  # ALDOA
+  "2597" =  0.9,  # GAPDH
+  "5315" =  1.3,  # PKM
+  "3939" =  1.7,  # LDHA
+  "5160" = -1.0,  # PDHA1
+  "5162" = -0.8   # PDHB
+)
+
+# Paint expression changes onto glycolysis pathway
+pathview(
+  gene.data = gene_fc,
+  pathway.id = "00010",
+  species = "hsa",
+  kegg.native = TRUE
+)
+```
+
+```{r, echo=FALSE, fig.align='center', out.width='90%'}
+knitr::include_graphics(c("hsa00010.pathview.png"))
+```
+
+```{r metabolites}
+# Hypothetical metabolite abundance changes
+# KEGG Compound IDs and log2 fold changes
+
+metabolite_fc <- c(
+  "C00031" =  1.2,  # Glucose
+  "C00022" =  0.8,  # Pyruvate
+  "C00186" =  2.0   # Lactate
+)
+
+# Integrate gene expression and metabolite data
+pathview(
+  gene.data = gene_fc,
+  cpd.data = metabolite_fc,
+  pathway.id = "00010",
+  species = "hsa",
+  kegg.native = TRUE
+)
+```
+
+```{r, echo=FALSE, fig.align='center', out.width='90%'}
+knitr::include_graphics(c("hsa00010.pathview.png"))
+```
