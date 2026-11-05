@@ -1,0 +1,186 @@
+---
+title: "Metaboanalyst tutorial"
+output: html_document
+date: "2026-11-03"
+URL: "https://www.metaboanalyst.ca/resources/vignettes/Statistical_Analysis_Module.html"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Clean global environment
+rm(list = ls())
+```
+
+```{r kill_running_rserve_instance}
+# Find and terminate any process listening on port 6311
+port <- 6311
+pids <- system(sprintf("lsof -ti tcp:%d", port), intern = TRUE, ignore.stderr = TRUE)
+if (length(pids) > 0) {
+  message("Killing process(es) using port ", port, ": ",  paste(pids, collapse = ", "))
+  system2("kill", pids)
+  Sys.sleep(1)
+}
+```
+
+```{r load_metaboanalystr}
+# Load the MetaboAnalystR package
+library(MetaboAnalystR)
+packageVersion("MetaboAnalystR")
+
+# Load the missing volcano plotting helper function
+volcano_url <- paste0("https://raw.githubusercontent.com/xia-lab/MetaboAnalystR/",
+  "f32af5d5a90532f69474208b17b2db6e40a8f3da/R/util_volcano.R"
+)
+volcano_script <- "util_volcano.R"
+download.file(volcano_url, destfile = volcano_script, mode = "wb")
+source(volcano_script)
+
+```
+
+```{r init_mset_object}
+# Initializes the mSet data
+mSet <- InitDataObjects("conc", "stat", FALSE)
+```
+
+```{r load_the_data_set}
+data_path <- '/mnt/teaching/bioinformatics/metaboanalyst/human_cachexia.csv'
+mSet <- Read.TextData(mSet, data_path, format = "rowu", lbl.type = "disc")
+str(mSet)
+```
+
+```{r perform_sanity_checks}
+# Confirm that the data were loaded and check for missing values
+mSet <- SanityCheckData(mSet)
+mSet <- MetaboAnalystR:::PerformSanityClosure(mSet)
+```
+
+```{r check_groups}
+# Examine the group assignments
+table(mSet$dataSet$cls)
+```
+
+```{r normalize}
+# Normalize data
+mSet <- PreparePrenormData(mSet)
+mSet <- Normalization(mSet, "NULL", "LogNorm", "MeanCenter", "S10T0", ratio=FALSE, ratioNum=20)
+
+# Examine the dimensions of the imported dataset
+dim(mSet$dataSet$norm)
+```
+
+```{r generated_normalization_plots}
+mSet <- PlotNormSummary(mSet, "norm_0_", format ="png", dpi=72, width=NA)
+mSet <- PlotSampleNormSummary(mSet, "snorm_0_", format = "png", dpi=72, width=NA)
+```
+
+```{r plot_normalized_data, echo=FALSE, fig.align='center', out.width='90%'}
+knitr::include_graphics(c("norm_0_dpi72.png", "snorm_0_dpi72.png"))
+```
+
+```{r analyze_fold_changes}
+# Perform fold-change analysis on uploaded data, unpaired 
+mSet <- FC.Anal(mSet, fc.thresh = 2.0, cmp.type = 0, paired = FALSE)
+
+# Inspect log2 fold changes
+head(sort(mSet$analSet$fc$fc.log))
+```
+
+```{r generate_t_test_table}
+# Extract t-test results
+tt <- mSet$analSet$tt
+
+tt_results <- data.frame(
+  Metabolite = names(tt$p.value),
+  t_statistic = as.numeric(tt$t.score),
+  p_value = as.numeric(tt$p.value),
+  FDR = as.numeric(tt$fdr.p),
+  Significant = as.logical(tt$inx.imp)
+)
+
+# Add log2 fold change
+tt_results$log2FC <- mSet$analSet$fc$fc.log[match(tt_results$Metabolite, names(mSet$analSet$fc$fc.log))]
+
+# Display the combined table
+tt_results <- tt_results[order(tt_results$FDR), c("Metabolite", "log2FC", "t_statistic", "p_value", "FDR", "Significant")]
+
+# Display a formatted table in R Markdown
+knitr::kable(tt_results, digits = 4,caption = "Differential metabolite analysis")
+```
+
+```{r generate_fold_change_plot}
+# Plot fold-change analysis
+mSet <- PlotFC(mSet, "fc_0_", "png", 72, width=NA)
+```
+
+```{r plot_fold_changes, echo=FALSE, fig.align='center', out.width='90%'}
+knitr::include_graphics(c("fc_0_dpi72.png"))
+```
+
+```{r perform_volcano_analysis}
+# Perform the volcano analysis
+mSet <- Volcano.Anal( mSet, paired = FALSE, fcthresh = 2.0, cmpType=0, nonpar=FALSE, threshp = 0.05, equal.var=TRUE, pval.type="fdr")
+```
+
+```{r generage_vocano_plot}
+# Create the volcano plot
+mSet <- PlotVolcano(mSet, "volcano_0_", 1, 0, format="png", dpi=72, width=NA)
+```
+
+```{r volcano_plot, echo=FALSE, fig.align='center', out.width='90%'}
+knitr::include_graphics(c("volcano_0_dpi72.png"))
+```
+
+```{r}
+# Correlation Analysis: Heatmap specifying pearson distance and an overview
+mSet <- PlotCorrHeatMap(
+  mSetObj = mSet,        # Updated parameter name
+  imgName = "corr_0_",
+  format  = "png",
+  dpi     = 72,
+  width   = NA,
+  target  = "col",
+  cor.method = "pearson", # Updated parameter name
+  colors  = "bwm",
+  fix.col = FALSE,       
+  no.clst = FALSE,        # Controls whether to skip clustering (TRUE/FALSE)
+  corrCutoff = 0.0,        # Replaces rep.thr for filtering weak correlations
+  fz = 3,
+  unit = 3
+)
+```
+
+```{r plot_correlation_heatmap, echo=FALSE, fig.align='center', out.width='90%'}
+knitr::include_graphics(c("rpt_corr_heatmap.png"))
+```
+```{r pca}
+# Perform PCA analysis
+mSet <- PCA.Anal(mSet)
+```
+
+```{r generate_pca_plots}
+# Create PCA scree plot
+mSet <- PlotPCAScree(mSet, "pca_scree_0_", "png", dpi = 72, width=NA, 5)
+
+# Create a 2D PCA score plot
+mSet <- PlotPCA2DScore(mSet, "pca_score2d_0_", format = "png", dpi=72, width=NA, 1, 2, 0.95, 1, 0)
+
+# Create a PCA loadings Plots
+mSet <- PlotPCALoading(mSet, "pca_loading_0_", "png", 72, width=NA, 1,2)
+
+# Create a PCA Biplot
+mSet <- PlotPCABiplot(mSet, "pca_biplot_0_", format = "png", dpi = 72, width=NA, 1, 2)
+```
+
+```{r pca_plots, echo=FALSE, fig.align='center', out.width='90%'}
+knitr::include_graphics(c("pca_scree_0_dpi72.png", "pca_score2d_0_dpi72.png", "pca_loading_0_dpi72.png", "pca_biplot_0_dpi72.png"))
+```
+
+```{r hierarchical_clustering}
+# Perform hierarchical clustering and plot dendogram
+mSet <- PlotHCTree(mSet, "tree_0_", format = "png", dpi=72, width=NA, "euclidean", "ward.D")
+```
+
+```{r plot_hc_tree, echo=FALSE, fig.align='center', out.width='90%'}
+knitr::include_graphics(c("tree_0_dpi72.png"))
+```
