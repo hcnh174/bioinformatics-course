@@ -1,0 +1,412 @@
+---
+title: "Single-cell multi-omics: integrating gene expression and chromatin accessibility"
+subtitle: "A hands-on Seurat and Signac practical using 10x Genomics PBMC Multiome data"
+author: "Bioinformatics practical"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: readable
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 6,
+  dpi = 110
+)
+set.seed(1234)
+options(stringsAsFactors = FALSE)
+```
+
+# Biological motivation
+
+A cell's transcriptome describes which genes are being expressed. Chromatin accessibility provides complementary information about which genomic regions are open and potentially available to regulatory proteins.
+
+For example, in a tumor-infiltrating T cell:
+
+- RNA measurements might show expression of **PDCD1**, **TOX**, or **LAG3**.
+- ATAC measurements can show whether regulatory regions near these genes are accessible.
+- Protein measurements (for example, CITE-seq) can determine whether RNA changes correspond to altered surface protein abundance.
+
+This practical uses a healthy-donor PBMC dataset, not a tumor dataset. We will use it to learn the computational principles with paired RNA and ATAC measurements. The same analytical ideas can later be applied to tumor-infiltrating lymphocytes.
+
+> **Important:** RNA and ATAC are measured in the same cells in this 10x Multiome experiment. This is different from integrating two unrelated datasets based only on similar cell types.
+
+# Experimental dataset
+
+We use the public 10x Genomics **PBMC granulocyte-sorted 10k Multiome** dataset. It contains gene-expression counts, ATAC peak counts, and an ATAC fragments file for the same cell barcodes.
+
+The dataset is available from 10x Genomics:
+
+- [Filtered feature-barcode matrix (HDF5)](https://cf.10xgenomics.com/samples/cell-arc/1.0.0/pbmc_granulocyte_sorted_10k/pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5)
+- [ATAC fragments](https://cf.10xgenomics.com/samples/cell-arc/1.0.0/pbmc_granulocyte_sorted_10k/pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz)
+- [ATAC fragments index](https://cf.10xgenomics.com/samples/cell-arc/1.0.0/pbmc_granulocyte_sorted_10k/pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz.tbi)
+
+```{r install-packages, eval=FALSE}
+#install.packages(c("Seurat", "Signac", "ggplot2", "patchwork", "hdf5r"))
+
+#if (!requireNamespace("BiocManager", quietly = TRUE)) {
+#  install.packages("BiocManager")
+#}
+
+#BiocManager::install(c(
+#  "EnsDb.Hsapiens.v86",
+#  "BSgenome.Hsapiens.UCSC.hg38",
+#  "GenomeInfoDb",
+#  "GenomicRanges"
+#))
+```
+
+```{r libraries}
+library(Seurat)
+library(Signac)
+library(ggplot2)
+library(patchwork)
+library(EnsDb.Hsapiens.v86)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(GenomeInfoDb)
+library(GenomicRanges)
+```
+
+```{r versions}
+packageVersion("Seurat")
+packageVersion("Signac")
+#sessionInfo()
+```
+
+# 2. Download and load the data
+
+Set a local data directory. If the files are already present, the download step will be skipped.
+
+```{r download-data}
+data_dir <- "data_pbmc_multiome"
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+base_url <- paste0("https://cf.10xgenomics.com/samples/cell-arc/1.0.0/", "pbmc_granulocyte_sorted_10k/")
+
+files <- c(
+  matrix = "pbmc_granulocyte_sorted_10k_filtered_feature_bc_matrix.h5",
+  fragments = "pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz",
+  index = "pbmc_granulocyte_sorted_10k_atac_fragments.tsv.gz.tbi"
+)
+
+for (nm in names(files)) {
+  dest <- file.path(data_dir, files[[nm]])
+  if (!file.exists(dest)) {
+    download.file(url = paste0(base_url, files[[nm]]),  destfile = dest,  mode = "wb",  method = "auto")
+  }
+}
+
+matrix_file <- file.path(data_dir, files[["matrix"]])
+fragment_file <- file.path(data_dir, files[["fragments"]])
+```
+
+Read the HDF5 matrix. It contains separate matrices for Gene Expression and Peaks.
+
+```{r read-data}
+counts <- Read10X_h5(matrix_file)
+
+names(counts)
+dim(counts[["Gene Expression"]])
+dim(counts[["Peaks"]])
+```
+
+**Check your understanding:** Why do we have two feature-by-cell matrices, and why are their rows different?
+
+# 3. Create a multiome Seurat object
+
+We first create a standard Seurat object from the RNA counts. Then we add an ATAC assay containing the peak counts and links to the fragments file.
+
+```{r create-object}
+# Obtain gene annotations from Ensembl.
+annotation <- GetGRangesFromEnsDb(ensdb = EnsDb.Hsapiens.v86)
+seqlevelsStyle(annotation) <- "UCSC"
+genome(annotation) <- "hg38"
+
+# Create the RNA object.
+multiome <- CreateSeuratObject(
+  counts = counts[["Gene Expression"]],
+  assay = "RNA",
+  project = "PBMC_Multiome"
+)
+
+# Add the ATAC assay.
+multiome[["ATAC"]] <- CreateChromatinAssay(
+  counts = counts[["Peaks"]],
+  sep = c(":", "-"),
+  genome = "hg38",
+  fragments = fragment_file,
+  annotation = annotation
+)
+
+multiome
+Assays(multiome)
+```
+
+The same cell barcode identifies the RNA and ATAC measurements from a given cell. The two assays are therefore paired at the single-cell level.
+
+# 4. Quality control
+
+Quality control is performed separately for the two modalities.
+
+For RNA, we inspect the number of detected genes, total RNA counts, and mitochondrial percentage.
+For ATAC, we inspect the number of detected peaks, nucleosome signal, and transcription start site (TSS) enrichment.
+
+```{r qc-metrics}
+DefaultAssay(multiome) <- "RNA"
+multiome[["percent.mt"]] <- PercentageFeatureSet(multiome, pattern = "^MT-")
+
+DefaultAssay(multiome) <- "ATAC"
+multiome <- NucleosomeSignal(multiome)
+multiome <- TSSEnrichment(multiome, fast = FALSE)
+```
+
+```{r qc-plots, fig.height=8}
+DefaultAssay(multiome) <- "RNA"
+p1 <- VlnPlot(multiome, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),  ncol = 3, pt.size = 0)
+
+DefaultAssay(multiome) <- "ATAC"
+p2 <- VlnPlot(multiome, features = c("nCount_ATAC", "TSS.enrichment", "nucleosome_signal"), ncol = 3, pt.size = 0)
+
+p1 / p2
+```
+
+These distributions help identify low-quality cells, but thresholds should be chosen after inspecting the data rather than copied blindly from another experiment.
+
+For this teaching exercise, use deliberately broad starting thresholds. Depending on package versions and the precise data release, you may wish to adjust them after inspecting the plots.
+
+```{r filter-cells}
+multiome$peak_region_fragments <- multiome$nCount_ATAC
+keep <- with(multiome[[]], nFeature_RNA > 300 & nCount_RNA > 500 & percent.mt < 20 & nCount_ATAC > 1000 & TSS.enrichment > 1)
+table(keep)
+multiome <- subset(multiome, cells = colnames(multiome)[keep])
+multiome
+```
+
+# 5. Analyze the RNA modality independently
+
+We begin with a conventional scRNA-seq workflow. Normalize the RNA counts, identify variable genes, scale the data, and calculate principal components.
+
+```{r rna-processing}
+DefaultAssay(multiome) <- "RNA"
+multiome <- NormalizeData(multiome)
+multiome <- FindVariableFeatures(multiome, selection.method = "vst", nfeatures = 3000)
+multiome <- ScaleData(multiome, features = VariableFeatures(multiome))
+multiome <- RunPCA(multiome, features = VariableFeatures(multiome), npcs = 50)
+
+ElbowPlot(multiome, ndims = 50)
+```
+
+For demonstration purposes, we will use the first 30 principal components.
+
+```{r rna-embedding}
+multiome <- FindNeighbors(multiome, reduction = "pca", dims = 1:30, graph.name = "RNA_snn")
+multiome <- FindClusters(multiome, graph.name = "RNA_snn", resolution = 0.5)
+multiome <- RunUMAP(multiome, reduction = "pca", dims = 1:30, reduction.name = "rna.umap", reduction.key = "rnaUMAP_")
+
+DimPlot(multiome, reduction = "rna.umap", group.by = "seurat_clusters", label = TRUE) + ggtitle("RNA-only UMAP")
+```
+
+## 5.1 Identify cell populations using marker genes
+
+Explore canonical PBMC markers. These are useful starting points, but marker expression should be interpreted in combination rather than treating any one gene as definitive.
+
+| Cell population | Example markers |
+|---|---|
+| T cells | CD3D, CD3E, TRAC |
+| CD4 T cells | IL7R, CCR7 |
+| CD8 T cells | CD8A, CD8B |
+| B cells | MS4A1, CD79A |
+| NK cells | NKG7, GNLY |
+| Monocytes | LST1, LYZ, S100A8 |
+
+```{r rna-feature-plots, fig.height=8}
+DefaultAssay(multiome) <- "RNA"
+FeaturePlot(multiome, features = c("CD3D", "CD8A", "IL7R", "MS4A1", "NKG7", "LYZ"), reduction = "rna.umap", ncol = 3)
+```
+
+A dot plot summarizes both the fraction of cells expressing a marker and its average expression.
+
+```{r rna-dotplot, fig.height=5}
+DotPlot(multiome, features = c("CD3D", "CD3E", "IL7R", "CD8A", "MS4A1", "CD79A", "NKG7", "GNLY", "LST1", "LYZ")) + RotatedAxis()
+```
+
+**Interpretation exercise:** Which clusters appear to contain T cells, B cells, NK cells, and monocytes? Do not assign identities from cluster numbers alone. Use the marker patterns.
+
+# 6. Analyze chromatin accessibility independently
+Now we switch to the ATAC assay. Unlike RNA counts, ATAC counts represent the number of fragments overlapping genomic peaks.
+We use term-frequency inverse-document-frequency (TF-IDF) normalization followed by latent semantic indexing (LSI).
+
+```{r atac-processing}
+DefaultAssay(multiome) <- "ATAC"
+multiome <- FindTopFeatures(multiome, min.cutoff = "q0")
+multiome <- RunTFIDF(multiome)
+multiome <- RunSVD( multiome, n = 50)
+
+DepthCor(multiome)
+```
+
+The first LSI component can be strongly correlated with sequencing depth. We will therefore use dimensions 2–30 for the downstream ATAC embedding, a common starting strategy.
+
+```{r atac-embedding}
+multiome <- FindNeighbors(multiome, reduction = "lsi", dims = 2:30, graph.name = "ATAC_snn")
+multiome <- FindClusters(multiome, graph.name = "ATAC_snn", resolution = 0.5)
+multiome <- RunUMAP(multiome, reduction = "lsi", dims = 2:30,  reduction.name = "atac.umap", reduction.key = "atacUMAP_")
+
+DimPlot(multiome, reduction = "atac.umap", group.by = "ATAC_snn_res.0.5", label = TRUE) + ggtitle("ATAC-only UMAP")
+```
+
+**Compare the embeddings:** Do the RNA and ATAC UMAPs show similar broad populations? Which populations appear more clearly separated in one modality?
+
+Remember that UMAP axes have no direct biological units. The orientation and distances between separated islands should not be interpreted as a literal map of cell differentiation.
+
+# 7. Visualize gene activity and chromatin accessibility
+
+## 7.1 Gene activity
+
+RNA measures gene transcripts. ATAC does not directly measure transcripts. As a rough proxy, we can calculate gene activity by counting accessible fragments over gene bodies and promoter regions.
+
+```{r gene-activity}
+DefaultAssay(multiome) <- "ATAC"
+gene.activities <- GeneActivity(multiome, features = c("CD3D", "MS4A1", "NKG7", "LYZ"), extend.upstream = 2000, extend.downstream = 0)
+multiome[["ACTIVITY"]] <- CreateAssayObject(counts = gene.activities)
+
+DefaultAssay(multiome) <- "ACTIVITY"
+multiome <- NormalizeData(multiome)
+```
+
+Compare the RNA expression and ATAC-derived gene activity for the same marker genes.
+
+```{r gene-activity-plots1} #, fig.height=8}
+DefaultAssay(multiome) <- "RNA"
+p_rna <- FeaturePlot(multiome, features = c("CD3D", "MS4A1", "NKG7", "LYZ"), reduction = "rna.umap", ncol = 2)
+p_rna
+```
+
+```{r gene-activity-plots2}
+DefaultAssay(multiome) <- "ACTIVITY"
+p_activity <- FeaturePlot(multiome, features = c("CD3D", "MS4A1", "NKG7", "LYZ"), reduction = "rna.umap", ncol = 2)
+p_activity
+#p_rna / p_activity
+```
+
+Here we deliberately plot both measurements on the RNA UMAP so that the spatial positions of cells remain fixed. This is a comparison of measurements, not an ATAC-derived embedding.
+
+Gene activity is an approximation. It is not equivalent to measuring RNA, and the two values should not be expected to match exactly.
+
+## 7.2 Inspect a genomic region
+
+A coverage plot shows ATAC fragment coverage across a genomic region. This makes the chromatin measurement more tangible: instead of a cell-level score, we can inspect where accessible fragments accumulate around a gene.
+
+```{r coverage-plot, fig.height=7}
+DefaultAssay(multiome) <- "ATAC"
+CoveragePlot(object = multiome, region = "CD3D", group.by = "seurat_clusters",
+             extend.upstream = 3000, extend.downstream = 3000, peaks = TRUE, annotation = TRUE)
+```
+
+Try changing `region = "CD3D"` to `"MS4A1"` or `"LYZ"`.
+
+**Interpretation:** Are accessible regions around the gene similar across clusters, or do some clusters show distinct accessibility patterns?
+
+# 8. Integrate RNA and ATAC using weighted nearest neighbors
+
+We now have two representations of the same cells:
+
+- PCA: a low-dimensional representation of gene expression.
+- LSI: a low-dimensional representation of chromatin accessibility.
+
+WNN integration calculates cell neighborhoods using both modalities. It estimates how informative each modality is for each cell and combines the neighborhood information.
+
+This is not simply concatenating the RNA and ATAC matrices.
+
+```{r wnn-integration}
+multiome <- FindMultiModalNeighbors(object = multiome, reduction.list = list("pca", "lsi"), 
+                                    dims.list = list(1:30, 2:30), modality.weight.name = "RNA.weight")
+```
+
+Calculate a UMAP from the weighted nearest-neighbor graph and identify clusters using the weighted shared nearest-neighbor graph.
+
+```{r wnn-embedding}
+multiome <- RunUMAP(multiome, nn.name = "weighted.nn", reduction.name = "wnn.umap", reduction.key = "wnnUMAP_")
+
+multiome <- FindClusters(multiome, graph.name = "wsnn", algorithm = 3, resolution = 0.5)
+
+DimPlot(multiome, reduction = "wnn.umap", group.by = "seurat_clusters", label = TRUE) + ggtitle("Integrated RNA + ATAC WNN UMAP")
+```
+
+Compare the three embeddings side by side.
+
+```{r compare-embeddings, fig.width=12, fig.height=5}
+p_rna <- DimPlot(multiome, reduction = "rna.umap", group.by = "seurat_clusters") + ggtitle("RNA")
+
+p_atac <- DimPlot(multiome, reduction = "atac.umap", group.by = "seurat_clusters") + ggtitle("ATAC")
+
+p_wnn <- DimPlot(multiome, reduction = "wnn.umap", group.by = "seurat_clusters", label = TRUE) + ggtitle("WNN integrated")
+
+p_rna + p_atac + p_wnn
+```
+
+The clusters displayed here are the WNN-derived cluster labels overlaid on each embedding. To compare the independently derived RNA and ATAC clusterings, use the separate metadata columns created earlier.
+
+## 8.1 Inspect modality weights
+
+WNN estimates a relative contribution from each modality for each cell. The `RNA.weight` metadata column records the RNA contribution; the complementary contribution is from ATAC.
+
+```{r modality-weights}
+VlnPlot(multiome, features = "RNA.weight", group.by = "seurat_clusters", pt.size = 0) + NoLegend()
+```
+
+Plot the RNA weight on the integrated UMAP.
+
+```{r modality-weight-umap}
+FeaturePlot(multiome, features = "RNA.weight", reduction = "wnn.umap")
+```
+
+A higher RNA weight means that RNA was relatively more informative for defining that cell's local neighborhood under this model. It does **not** mean that the cell contains more RNA, or that RNA is biologically more important overall.
+
+# 9. Compare the integrated result with the original modalities
+
+The goal of integration is not necessarily to produce a dramatically different UMAP. Instead, it is to use complementary information to improve the representation of cell relationships.
+
+Review the following:
+
+1. Which cell populations are recognizable in both RNA and ATAC?
+2. Are there clusters whose neighborhoods change after WNN integration?
+3. Do cells with similar RNA profiles but different chromatin profiles become more distinguishable?
+4. Are any apparent differences likely to be technical rather than biological?
+
+You can also inspect marker expression on the WNN embedding.
+
+```{r integrated-markers, fig.height=8}
+DefaultAssay(multiome) <- "RNA"
+
+FeaturePlot(multiome, features = c("CD3D", "CD8A", "IL7R", "MS4A1", "NKG7", "LYZ"), reduction = "wnn.umap", ncol = 3)
+```
+
+# 10. Connect the practical to tumor immunology
+
+The PBMC dataset provides a useful reference for broad immune-cell populations. In a tumor, the same approach could be used to investigate T-cell states.
+
+Consider these example genes:
+
+| Biological process | Example genes |
+|---|---|
+| T-cell identity | CD3D, CD3E, TRAC |
+| Cytotoxicity | NKG7, PRF1, GZMB |
+| T-cell activation | CD69, IL2RA |
+| Inhibitory receptors | PDCD1, CTLA4, LAG3, TIGIT |
+| Exhaustion-associated regulation | TOX, NR4A1, NR4A2 |
+
+A more complete tumor study could combine:
+
+- RNA: transcriptional state of tumor-infiltrating T cells.
+- ATAC: accessibility of regulatory regions associated with activation or exhaustion.
+- CITE-seq: surface abundance of proteins such as PD-1, TIM-3, and LAG-3.

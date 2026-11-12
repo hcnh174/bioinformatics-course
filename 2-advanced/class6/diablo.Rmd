@@ -1,0 +1,143 @@
+---
+title: "mixOmics DIABLO demo"
+output: html_document
+date: "2026-11-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# ==============================================================================
+# Multi-Omics Integration using mixOmics DIABLO (Multiblock sPLS-DA)
+# ==============================================================================
+
+#BiocManager::install("mixOmics")
+# Load mixOmics library
+library(mixOmics)
+
+set.seed(123) # For reproducibility
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# 1. Data Preparation
+# ------------------------------------------------------------------------------
+data(breast.TCGA)
+
+# Extract predictor blocks (X) and sample outcome labels (Y)
+X <- list(
+  mRNA    = breast.TCGA$data.train$mrna,
+  miRNA   = breast.TCGA$data.train$mirna,
+  protein = breast.TCGA$data.train$protein
+)
+
+Y <- breast.TCGA$data.train$subtype  # Categorical class labels (e.g., Basal, Her2, LumA)
+
+# Define design matrix (connection between datasets: 0.1 for trade-off between discrimination and correlation)
+design <- matrix(0.1, ncol = length(X), nrow = length(X), 
+                 dimnames = list(names(X), names(X)))
+diag(design) <- 0
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# 2. Parameter Tuning (Components & Feature Selection)
+# ------------------------------------------------------------------------------
+
+# Step 2a: Estimate performance to choose optimal number of components
+diablo.unsparse <- block.plsda(X, Y, ncomp = 5, design = design)
+perf.diablo <- perf(diablo.unsparse, validation = 'Mfold', folds = 5, nrepeat = 10)
+
+# Extract recommended number of components (using BER / Centroids distance)
+ncomp <- perf.diablo$choice.ncomp$WeightedVote["Overall.BER", "centroids.dist"]
+if (is.na(ncomp) || ncomp < 2) ncomp <- 2  # Default to at least 2 components for plotting
+```
+
+```{r}
+# Step 2b: Fine-tune the number of features to select from each omics block (keepX)
+test.keepX <- list(
+  mRNA    = c(5:10, 15, 20),
+  miRNA   = c(5:10, 15, 20),
+  protein = c(5:10, 15, 20)
+)
+
+tune.diablo <- tune.block.splsda(
+  X, Y, 
+  ncomp = ncomp, 
+  test.keepX = test.keepX, 
+  design = design, 
+  validation = 'Mfold', 
+  folds = 5, 
+  nrepeat = 5
+)
+
+list.keepX <- tune.diablo$choice.keepX
+list.keepX
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# 3. Fit Final DIABLO Model
+# ------------------------------------------------------------------------------
+final.diablo <- block.splsda(
+  X = X, 
+  Y = Y, 
+  ncomp = ncomp, 
+  keepX = list.keepX, 
+  design = design
+)
+
+print("Final selected features per block and component:")
+print(final.diablo$keepX)
+```
+
+```{r}
+# ------------------------------------------------------------------------------
+# 4. Diagnostic & Integration Visualizations
+# ------------------------------------------------------------------------------
+
+# --- Plot 1: Diagnostic Correlation Plot ---
+# Verifies correlation between latent components across data blocks
+plotDiablo(final.diablo, ncomp = 1)
+```
+
+```{r}
+# --- Plot 2: Sample Projections Across Blocks ---
+# Displays sample clustering in latent space for each individual omics block
+plotIndiv(
+  final.diablo, 
+  ind.names = FALSE, 
+  legend = TRUE, 
+  title = "DIABLO Sample Subtype Separation"
+)
+```
+
+```{r}
+# --- Plot 3: Feature Loadings ---
+# Highlights top signature variables driving classification per block
+plotLoadings(final.diablo, comp = 1, contrib = 'max', method = 'median')
+```
+
+```{r}
+# --- Plot 4: Circos Plot ---
+# Shows cross-omics feature correlations (|r| > 0.7) connecting key biomarkers
+circosPlot(
+  final.diablo, 
+  cutoff = 0.7, 
+  line = TRUE, 
+  color.blocks = c("darkorchid", "brown1", "lightseagreen"),
+  color.cor = c("chocolate1", "skyblue")
+)
+```
+
+```{r}
+# --- Plot 5: Clustered Image Map (Heatmap) ---
+# Multi-block correlation heatmap of top selected features
+pdf("diablo_heatmap.pdf", width = 12, height = 12)
+cimDiablo(final.diablo, margins = c(8, 12), color.Y = c("purple", "orange", "cyan"))
+dev.off()
+```
+
